@@ -1,0 +1,6 @@
+Problem,Correct_Answer,BoN_Answer,BoN_Correct,BoN_Tokens,BoN_Time_s,PRSE_Answer,PRSE_Correct,PRSE_Tokens,PRSE_Time_s
+Natalia sold clips...,72,72,True,5596,174.84,72,True,115094,609.98
+Weng earns $12...,10,10,True,9941,11.58,10,True,136250,669.33
+Betty is saving...,5,5,True,6922,5.77,5,True,89085,445.56
+Julie is reading...,42,42,True,5594,3.4,42,True,83692,404.73
+James writes...,624,624,True,6140,11.04,624,True,102450,567.25
