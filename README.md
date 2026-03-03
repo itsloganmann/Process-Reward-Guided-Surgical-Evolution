@@ -98,7 +98,8 @@ cd Process-Reward-Guided-Surgical-Evolution
 Install the required dependencies:
 
 ```bash
-pip install vllm torch datasets pandas matplotlib seaborn
+pip install -r requirements.txt
+pip install vllm torch
 ```
 
 ## Usage
