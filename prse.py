@@ -37,7 +37,7 @@ BestOfNRunner
     Baseline: generate N independent traces, pick the highest-fitness one.
 
 load_math_problems()
-    Load Level 4 and Level 5 problems from the lighteval/MATH dataset
+    Load Level 4 and Level 5 problems from the hendrycks/competition_math dataset
     (HuggingFace), which provides the challenging benchmark where BoN fails.
 
 setup_output_dirs()
@@ -66,11 +66,18 @@ Usage
 
 from __future__ import annotations
 
+import os
+
+# Must be set before any protobuf-backed library (e.g. datasets / tensorboard)
+# is imported.  Protobuf ≥ 4.x removed MessageFactory.GetPrototype; the
+# pure-Python implementation restores the legacy API.  To avoid this overhead
+# in production, pin protobuf to a 3.x release (e.g. protobuf==3.20.*).
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import csv
 import dataclasses
 import json
 import logging
-import os
 import re
 import sys
 import threading
@@ -1266,11 +1273,11 @@ def load_math_problems(
     subjects: Optional[List[str]] = None,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Load Level 4 and Level 5 problems from the lighteval/MATH dataset.
+    """Load Level 4 and Level 5 problems from the hendrycks/competition_math dataset.
 
-    The function streams the HuggingFace dataset, filters by level and
-    optionally by subject, then returns a random subsample of the requested
-    size.
+    The function loads the HuggingFace dataset (cached locally after the first
+    download), filters by level and optionally by subject, then returns a
+    random subsample of the requested size.
 
     Parameters
     ----------
@@ -1303,13 +1310,13 @@ def load_math_problems(
         )
 
     logger.info(
-        "Loading lighteval/MATH dataset (levels: %s, subjects: %s, n=%d)",
+        "Loading hendrycks/competition_math dataset (levels: %s, subjects: %s, n=%d)",
         sorted(MATH_TARGET_LEVELS),
         subjects or "all",
         num_problems,
     )
 
-    ds = load_dataset("lighteval/MATH", "all", split="test")
+    ds = load_dataset("hendrycks/competition_math", split="test")
 
     records: List[Dict[str, Any]] = []
     for item in ds:
@@ -1675,7 +1682,7 @@ def main() -> None:
     Pipeline
     --------
     1. Mount Google Drive (when running in Colab) and set up output dirs.
-    2. Load Level 4 and Level 5 problems from the ``lighteval/MATH`` dataset.
+    2. Load Level 4 and Level 5 problems from the ``hendrycks/competition_math`` dataset.
     3. Initialise vLLM models (generator + PRM) on the H100.
     4. For each problem:
        a. Run Best-of-N and record telemetry.
