@@ -12,7 +12,7 @@ Architecture overview
 ---------------------
 LocalModelManager
     Initialises two vLLM pipelines (generator + PRM) and exposes batched
-    generate / score helpers.
+    generate / score helpers.  Optimised for the H100 80 GB by default.
 
 ReasoningTrace
     Immutable-ish dataclass representing one individual in the population.
@@ -20,8 +20,8 @@ ReasoningTrace
     fitness, and a terminal flag.
 
 ComputeTracker
-    Thread-safe accounting of prompt tokens, completion tokens, wall-clock
-    GPU latency, and peak VRAM consumed across the entire search.
+    Thread-safe accounting of prompt tokens, completion tokens, PRM tokens,
+    wall-clock GPU latency, peak VRAM, mutation counts, and steps truncated.
 
 PRSEAlgorithm
     Orchestrates the evolutionary loop:
@@ -36,9 +36,25 @@ PRSEAlgorithm
 BestOfNRunner
     Baseline: generate N independent traces, pick the highest-fitness one.
 
+load_math_problems()
+    Load Level 4 and Level 5 problems from the lighteval/MATH dataset
+    (HuggingFace), which provides the challenging benchmark where BoN fails.
+
+setup_output_dirs()
+    Mount Google Drive (when running in Colab) and create the results
+    directory tree under /content/drive/MyDrive/PRSE_MATH_Results/.
+
+append_telemetry_row() / append_trace_record()
+    Incremental per-problem persistence helpers that write to CSV and JSONL
+    after every single problem so the run survives Colab timeouts.
+
+generate_plots()
+    Academic-quality visualisation suite (matplotlib + seaborn) producing
+    five high-resolution PNG/PDF graphs for the paper.
+
 main()
-    Loads 5 GSM8K sample problems, runs both runners with an equivalent
-    compute budget, and prints a comparative Pandas DataFrame.
+    Loads Level 4/5 MATH problems, runs PRSE and Best-of-N, saves results
+    incrementally, and generates all visualisation plots at the end.
 
 Usage
 -----
@@ -50,11 +66,29 @@ Usage
 
 from __future__ import annotations
 
-import re
-import time
-import threading
+import csv
 import dataclasses
-from typing import List, Optional, Tuple
+import json
+import logging
+import os
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Module-level logger.  Downstream code should use ``logging.getLogger`` with
+# its own ``__name__`` rather than printing directly.
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Optional heavy dependencies – imported lazily so the module itself can be
@@ -77,6 +111,21 @@ try:
     PANDAS_AVAILABLE = True
 except ImportError:
     PANDAS_AVAILABLE = False
+
+try:
+    from datasets import load_dataset  # type: ignore
+    DATASETS_AVAILABLE = True
+except ImportError:
+    DATASETS_AVAILABLE = False
+
+try:
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")  # non-interactive backend for server/Colab use
+    import matplotlib.pyplot as plt  # type: ignore
+    import seaborn as sns  # type: ignore
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    PLOTTING_AVAILABLE = False
 
 
 # ===========================================================================
@@ -162,6 +211,9 @@ class ComputeTracker:
     gpu_latency_s     : Cumulative wall-clock time (seconds) spent waiting
                         for GPU inference.
     peak_vram_mb      : Peak GPU VRAM consumed (MB), sampled via PyTorch.
+    mutations_applied : Number of Surgical Mutation offspring generated.
+    crossovers_applied: Number of Logical Grafting offspring generated.
+    steps_truncated   : Total reasoning steps truncated by Surgical Mutation.
     """
 
     def __init__(self) -> None:
@@ -171,6 +223,9 @@ class ComputeTracker:
         self.prm_tokens: int = 0
         self.gpu_latency_s: float = 0.0
         self.peak_vram_mb: float = 0.0
+        self.mutations_applied: int = 0
+        self.crossovers_applied: int = 0
+        self.steps_truncated: int = 0
 
     # ------------------------------------------------------------------
     # Update helpers
@@ -196,6 +251,24 @@ class ComputeTracker:
             self.gpu_latency_s += latency_s
             self._refresh_vram()
 
+    def record_mutation(self, steps_truncated: int) -> None:
+        """Record one Surgical Mutation event.
+
+        Parameters
+        ----------
+        steps_truncated:
+            Number of steps that were dropped from the parent trace before
+            the mutation continuation was generated.
+        """
+        with self._lock:
+            self.mutations_applied += 1
+            self.steps_truncated += steps_truncated
+
+    def record_crossover(self) -> None:
+        """Record one Logical Grafting (crossover) event."""
+        with self._lock:
+            self.crossovers_applied += 1
+
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
@@ -204,7 +277,7 @@ class ComputeTracker:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens + self.prm_tokens
 
-    def summary(self) -> dict:
+    def summary(self) -> Dict[str, Any]:
         """Return a plain-dict snapshot suitable for Pandas / logging."""
         return {
             "prompt_tokens": self.prompt_tokens,
@@ -213,6 +286,9 @@ class ComputeTracker:
             "total_tokens": self.total_tokens,
             "gpu_latency_s": round(self.gpu_latency_s, 3),
             "peak_vram_mb": round(self.peak_vram_mb, 1),
+            "mutations_applied": self.mutations_applied,
+            "crossovers_applied": self.crossovers_applied,
+            "steps_truncated": self.steps_truncated,
         }
 
     # ------------------------------------------------------------------
@@ -254,9 +330,11 @@ class LocalModelManager:
         Number of GPUs to shard each model across.  Set to 1 for a single
         H100.
     max_model_len:
-        Maximum context length passed to vLLM.
+        Maximum context length passed to vLLM.  8192 is a good default for
+        the H100 80 GB to accommodate long MATH reasoning traces.
     generator_gpu_memory_utilisation:
-        Fraction of GPU memory reserved for the generator.
+        Fraction of GPU memory reserved for the generator.  0.55 leaves
+        enough headroom for the PRM on the same 80 GB H100.
     prm_gpu_memory_utilisation:
         Fraction of GPU memory reserved for the PRM.  If both models share
         the same GPU, the two fractions should sum to ≤ 0.95.
@@ -273,7 +351,7 @@ class LocalModelManager:
         generator_model_id: str = "Qwen/Qwen2.5-Math-7B-Instruct",
         prm_model_id: Optional[str] = "peiyi9979/math-shepherd-mistral-7b-prm",
         tensor_parallel_size: int = 1,
-        max_model_len: int = 4096,
+        max_model_len: int = 8192,
         generator_gpu_memory_utilisation: float = 0.55,
         prm_gpu_memory_utilisation: float = 0.35,
     ) -> None:
@@ -286,6 +364,7 @@ class LocalModelManager:
 
         self._generator: Optional["LLM"] = None  # noqa: F821
         self._prm_llm: Optional["LLM"] = None  # noqa: F821
+        self._log = logging.getLogger(self.__class__.__name__)
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -299,6 +378,14 @@ class LocalModelManager:
             raise RuntimeError(
                 "vLLM is not installed.  Run: pip install vllm"
             )
+        self._log.info(
+            "Loading generator model '%s' (tensor_parallel=%d, "
+            "max_model_len=%d, gpu_mem_util=%.2f)",
+            self.generator_model_id,
+            self.tensor_parallel_size,
+            self.max_model_len,
+            self.generator_gpu_memory_utilisation,
+        )
         self._generator = LLM(
             model=self.generator_model_id,
             tensor_parallel_size=self.tensor_parallel_size,
@@ -306,6 +393,7 @@ class LocalModelManager:
             gpu_memory_utilization=self.generator_gpu_memory_utilisation,
             trust_remote_code=True,
         )
+        self._log.info("Generator ready.")
 
     def _ensure_prm(self) -> None:
         """Initialise the PRM vLLM engine if not already done."""
@@ -315,6 +403,11 @@ class LocalModelManager:
             raise RuntimeError(
                 "vLLM is not installed.  Run: pip install vllm"
             )
+        self._log.info(
+            "Loading PRM model '%s' (gpu_mem_util=%.2f)",
+            self.prm_model_id,
+            self.prm_gpu_memory_utilisation,
+        )
         self._prm_llm = LLM(
             model=self.prm_model_id,
             tensor_parallel_size=self.tensor_parallel_size,
@@ -322,6 +415,7 @@ class LocalModelManager:
             gpu_memory_utilization=self.prm_gpu_memory_utilisation,
             trust_remote_code=True,
         )
+        self._log.info("PRM ready.")
 
     # ------------------------------------------------------------------
     # Public interface
@@ -909,6 +1003,11 @@ class PRSEAlgorithm:
         latency = time.perf_counter() - t0
         tracker.add_generation(p_tok, c_tok, latency)
 
+        # Record mutation telemetry: steps_truncated = total - prefix kept.
+        steps_dropped = len(trace.steps) - prefix_len
+        for _ in texts:
+            tracker.record_mutation(steps_dropped)
+
         offspring: List[ReasoningTrace] = []
         for text in texts:
             new_steps_raw = _parse_steps(text)
@@ -994,6 +1093,7 @@ class PRSEAlgorithm:
                 is_terminal=_is_terminal(full_steps),
             )
             offspring.append(child)
+        tracker.record_crossover()
         return offspring
 
     # ------------------------------------------------------------------
@@ -1149,49 +1249,412 @@ class BestOfNRunner:
         return best, tracker
 
 
+
 # ===========================================================================
-# Section 8 – Main execution block
+# Section 8 – MATH Dataset loader
 # ===========================================================================
 
-# Five sample GSM8K problems with their ground-truth answers for accuracy eval.
-GSM8K_SAMPLES: List[Tuple[str, str]] = [
-    (
-        "Natalia sold clips to 48 of her friends in April, and then she sold "
-        "half as many clips in May. How many clips did Natalia sell altogether "
-        "in April and May?",
-        "72",
-    ),
-    (
-        "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 "
-        "minutes of babysitting. How much did she earn?",
-        "10",
-    ),
-    (
-        "Betty is saving money for a new wallet which costs $100. Betty has "
-        "only half of the money she needs. Her parents decided to give her $15 "
-        "for that purpose, and her grandparents gave her twice as much as her "
-        "parents. How much more money does Betty need to buy the wallet?",
-        "5",
-    ),
-    (
-        "Julie is reading a 120-page book. Yesterday, she was able to read 12 "
-        "pages and today, she read twice as many pages as yesterday. If she "
-        "wants to read half of the remaining pages tomorrow, how many pages "
-        "should she read tomorrow?",
-        "42",
-    ),
-    (
-        "James writes a 3-page letter to 2 different friends twice a week. "
-        "How many pages does he write a year?",
-        "624",
-    ),
+#: Difficulty levels to include (Level 4 and Level 5 are the hard tiers).
+MATH_TARGET_LEVELS: frozenset = frozenset({"Level 4", "Level 5"})
+
+#: Optional subject filter – ``None`` means all subjects are included.
+MATH_TARGET_SUBJECTS: Optional[List[str]] = None
+
+
+def load_math_problems(
+    num_problems: int = 50,
+    subjects: Optional[List[str]] = None,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """Load Level 4 and Level 5 problems from the lighteval/MATH dataset.
+
+    The function streams the HuggingFace dataset, filters by level and
+    optionally by subject, then returns a random subsample of the requested
+    size.
+
+    Parameters
+    ----------
+    num_problems:
+        Maximum number of problems to return.
+    subjects:
+        Optional whitelist of subjects (e.g. ``["Algebra", "Number Theory"]``).
+        When ``None`` all subjects are included.
+    seed:
+        Random seed for reproducible subsampling.
+
+    Returns
+    -------
+    A list of dicts with keys:
+        ``problem``  – the problem statement (str).
+        ``solution`` – the full reference solution (str).
+        ``answer``   – the extracted final answer (str).
+        ``level``    – difficulty level string, e.g. ``"Level 5"`` (str).
+        ``subject``  – problem type, e.g. ``"Algebra"`` (str).
+
+    Raises
+    ------
+    RuntimeError
+        When the ``datasets`` library is not installed.
+    """
+    if not DATASETS_AVAILABLE:
+        raise RuntimeError(
+            "The 'datasets' library is required to load MATH problems.  "
+            "Run: pip install datasets"
+        )
+
+    logger.info(
+        "Loading lighteval/MATH dataset (levels: %s, subjects: %s, n=%d)",
+        sorted(MATH_TARGET_LEVELS),
+        subjects or "all",
+        num_problems,
+    )
+
+    ds = load_dataset("lighteval/MATH", "all", split="test")
+
+    records: List[Dict[str, Any]] = []
+    for item in ds:
+        level: str = item.get("level", "")
+        subject: str = item.get("type", item.get("subject", ""))
+        if level not in MATH_TARGET_LEVELS:
+            continue
+        if subjects is not None and subject not in subjects:
+            continue
+
+        solution: str = item.get("solution", "")
+        # Extract the final \boxed{} answer from the reference solution.
+        answer = _extract_answer(_parse_steps(solution)) or solution.strip()
+
+        records.append(
+            {
+                "problem": item["problem"],
+                "solution": solution,
+                "answer": answer,
+                "level": level,
+                "subject": subject,
+            }
+        )
+
+    logger.info("Found %d problems matching filter criteria.", len(records))
+
+    # Reproducible shuffle + truncate.
+    import random
+    rng = random.Random(seed)
+    rng.shuffle(records)
+    return records[:num_problems]
+
+
+# ===========================================================================
+# Section 9 – Output / Persistence helpers
+# ===========================================================================
+
+# Column order for the per-problem telemetry CSV.
+_TELEMETRY_FIELDNAMES: List[str] = [
+    "problem_id",
+    "level",
+    "subject",
+    "problem_snippet",
+    "ground_truth",
+    # Best-of-N columns
+    "bon_answer",
+    "bon_correct",
+    "bon_prompt_tokens",
+    "bon_completion_tokens",
+    "bon_prm_tokens",
+    "bon_total_tokens",
+    "bon_wall_clock_s",
+    # PRSE columns
+    "prse_answer",
+    "prse_correct",
+    "prse_prompt_tokens",
+    "prse_completion_tokens",
+    "prse_prm_tokens",
+    "prse_total_tokens",
+    "prse_wall_clock_s",
+    "prse_mutations_applied",
+    "prse_crossovers_applied",
+    "prse_steps_truncated",
 ]
+
+
+def setup_output_dirs(base_dir: Optional[str] = None) -> Dict[str, Path]:
+    """Set up output directories, mounting Google Drive if running in Colab.
+
+    When ``base_dir`` is ``None`` the function attempts to detect whether it
+    is running inside Google Colab and, if so, mounts Drive and uses
+    ``/content/drive/MyDrive/PRSE_MATH_Results/`` as the base.  Outside
+    Colab it falls back to ``./prse_math_results/``.
+
+    Parameters
+    ----------
+    base_dir:
+        Override for the root output directory.  Absolute or relative path.
+
+    Returns
+    -------
+    A dict with keys ``"base"``, ``"plots"`` mapping to ``Path`` objects
+    that are guaranteed to exist after this call.
+    """
+    if base_dir is not None:
+        root = Path(base_dir)
+    else:
+        # Auto-detect Google Colab environment.
+        in_colab = "google.colab" in sys.modules or os.path.exists(
+            "/content"
+        )
+        if in_colab:
+            try:
+                from google.colab import drive  # type: ignore  # noqa: F401
+                drive.mount("/content/drive", force_remount=False)
+                # Verify the mount succeeded before relying on it.
+                drive_ok = os.path.isdir("/content/drive/MyDrive")
+                if drive_ok:
+                    logger.info("Google Drive mounted at /content/drive")
+                else:
+                    logger.warning(
+                        "Drive mount call succeeded but /content/drive/MyDrive "
+                        "is not accessible; falling back to local directory."
+                    )
+                    root = Path("./prse_math_results")
+            except Exception as exc:
+                logger.warning("Could not mount Google Drive: %s", exc)
+                drive_ok = False
+            if drive_ok:
+                root = Path("/content/drive/MyDrive/PRSE_MATH_Results")
+            else:
+                root = Path("./prse_math_results")
+        else:
+            root = Path("./prse_math_results")
+
+    plots_dir = root / "plots"
+    root.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory: %s", root.resolve())
+    return {"base": root, "plots": plots_dir}
+
+
+def append_telemetry_row(csv_path: Path, row: Dict[str, Any]) -> None:
+    """Append a single per-problem result row to the telemetry CSV.
+
+    Creates the file with a header row on the first call; subsequent calls
+    append without repeating the header.  Safe to call after every problem
+    so the run can be interrupted without losing prior results.
+
+    Parameters
+    ----------
+    csv_path:
+        Absolute path to the ``.csv`` file.
+    row:
+        Dict whose keys are a subset of ``_TELEMETRY_FIELDNAMES``.
+    """
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=_TELEMETRY_FIELDNAMES, extrasaction="ignore"
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def append_trace_record(jsonl_path: Path, record: Dict[str, Any]) -> None:
+    """Append a single trace record to the JSONL traces log.
+
+    Each line is a self-contained JSON object describing the full reasoning
+    traces (with step-level PRM scores) for one problem.
+
+    Parameters
+    ----------
+    jsonl_path:
+        Absolute path to the ``.jsonl`` file.
+    record:
+        Serialisable dict to append.
+    """
+    with open(jsonl_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# ===========================================================================
+# Section 10 – Visualisation
+# ===========================================================================
+
+
+def generate_plots(csv_path: Path, plots_dir: Path) -> None:
+    """Generate the full academic visualisation suite from the telemetry CSV.
+
+    Requires ``pandas``, ``matplotlib``, and ``seaborn``.  When these are
+    unavailable a warning is logged and the function returns immediately.
+
+    The following five plots are produced in both high-resolution PNG and PDF
+    formats inside ``plots_dir``:
+
+    1. **accuracy_vs_tokens.{png,pdf}**
+       Hero graph: Accuracy vs. total compute (tokens) for BoN and PRSE,
+       shown as a scatter/line plot with cumulative token axis.
+
+    2. **accuracy_vs_time.{png,pdf}**
+       Accuracy vs. wall-clock time (seconds) comparing both methods.
+
+    3. **compute_breakdown.{png,pdf}**
+       Stacked bar chart of generator tokens vs. PRM tokens for PRSE.
+
+    4. **difficulty_degradation.{png,pdf}**
+       Grouped bar chart of accuracy by problem level (Level 4 / Level 5)
+       for both methods.
+
+    5. **prm_rejection_rate.{png,pdf}**
+       Histogram of steps truncated per problem by the Surgical Mutation
+       operator.
+
+    Parameters
+    ----------
+    csv_path:
+        Path to ``prse_vs_bon_telemetry.csv`` written by ``main()``.
+    plots_dir:
+        Directory where plot files will be saved.
+    """
+    if not PLOTTING_AVAILABLE:
+        logger.warning(
+            "matplotlib/seaborn not available – skipping plot generation.  "
+            "Run: pip install matplotlib seaborn"
+        )
+        return
+    if not PANDAS_AVAILABLE:
+        logger.warning(
+            "pandas not available – skipping plot generation.  "
+            "Run: pip install pandas"
+        )
+        return
+    if not csv_path.exists():
+        logger.warning("Telemetry CSV not found at %s – no plots generated.", csv_path)
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        logger.warning("Telemetry CSV is empty – no plots generated.")
+        return
+
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.3)
+    _SAVE_DPI = 300
+
+    def _save(fig: "plt.Figure", name: str) -> None:  # type: ignore[name-defined]
+        for ext in ("png", "pdf"):
+            dest = plots_dir / f"{name}.{ext}"
+            fig.savefig(dest, dpi=_SAVE_DPI, bbox_inches="tight")
+            logger.info("Saved plot: %s", dest)
+        plt.close(fig)
+
+    # ---------------------------------------------------------------
+    # 1. Accuracy vs. Total Compute (Tokens) – HERO GRAPH
+    # ---------------------------------------------------------------
+    df_sorted = df.sort_values("bon_total_tokens")
+    bon_cum_tokens = df_sorted["bon_total_tokens"].cumsum()
+    prse_cum_tokens = df_sorted["prse_total_tokens"].cumsum()
+    bon_cum_acc = df_sorted["bon_correct"].expanding().mean() * 100
+    prse_cum_acc = df_sorted["prse_correct"].expanding().mean() * 100
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(bon_cum_tokens, bon_cum_acc, marker="o", label="Best-of-N", color="#2196F3")
+    ax.plot(prse_cum_tokens, prse_cum_acc, marker="s", label="PRSE", color="#FF5722")
+    ax.set_xlabel("Cumulative Tokens Consumed")
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Accuracy vs. Total Compute (Tokens)")
+    ax.legend()
+    _save(fig, "accuracy_vs_tokens")
+
+    # ---------------------------------------------------------------
+    # 2. Accuracy vs. Wall-Clock Time
+    # ---------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bon_cum_time = df_sorted["bon_wall_clock_s"].cumsum()
+    prse_cum_time = df_sorted["prse_wall_clock_s"].cumsum()
+    ax.plot(bon_cum_time, bon_cum_acc, marker="o", label="Best-of-N", color="#2196F3")
+    ax.plot(prse_cum_time, prse_cum_acc, marker="s", label="PRSE", color="#FF5722")
+    ax.set_xlabel("Cumulative Wall-Clock Time (s)")
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Accuracy vs. Wall-Clock Time")
+    ax.legend()
+    _save(fig, "accuracy_vs_time")
+
+    # ---------------------------------------------------------------
+    # 3. Compute Breakdown (PRSE): Generator Tokens vs. PRM Tokens
+    # ---------------------------------------------------------------
+    prse_gen = df["prse_prompt_tokens"] + df["prse_completion_tokens"]
+    prse_prm = df["prse_prm_tokens"]
+    problem_ids = range(len(df))
+
+    fig, ax = plt.subplots(figsize=(max(8, len(df) * 0.4), 5))
+    ax.bar(problem_ids, prse_gen, label="Generator Tokens", color="#4CAF50")
+    ax.bar(problem_ids, prse_prm, bottom=prse_gen, label="PRM Tokens", color="#FF9800")
+    ax.set_xlabel("Problem Index")
+    ax.set_ylabel("Token Count")
+    ax.set_title("PRSE Compute Breakdown per Problem")
+    ax.legend()
+    _save(fig, "compute_breakdown")
+
+    # ---------------------------------------------------------------
+    # 4. Difficulty Degradation: Accuracy by Level for BoN vs. PRSE
+    # ---------------------------------------------------------------
+    if "level" in df.columns:
+        level_stats = (
+            df.groupby("level")[["bon_correct", "prse_correct"]]
+            .mean()
+            .mul(100)
+            .reset_index()
+        )
+        x = range(len(level_stats))
+        width = 0.35
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.bar(
+            [i - width / 2 for i in x],
+            level_stats["bon_correct"],
+            width,
+            label="Best-of-N",
+            color="#2196F3",
+        )
+        ax.bar(
+            [i + width / 2 for i in x],
+            level_stats["prse_correct"],
+            width,
+            label="PRSE",
+            color="#FF5722",
+        )
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(level_stats["level"].tolist())
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_title("Accuracy by Difficulty Level")
+        ax.legend()
+        _save(fig, "difficulty_degradation")
+
+    # ---------------------------------------------------------------
+    # 5. PRM Rejection Rate: steps truncated per problem
+    # ---------------------------------------------------------------
+    if "prse_steps_truncated" in df.columns:
+        col = df["prse_steps_truncated"].dropna()
+        max_val = int(col.max()) if not col.empty and col.max() == col.max() else 0
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(
+            col,
+            bins=max(5, max_val + 1),
+            color="#9C27B0",
+            edgecolor="white",
+        )
+        ax.set_xlabel("Steps Truncated by Surgical Mutation")
+        ax.set_ylabel("Number of Problems")
+        ax.set_title("PRM Rejection Rate Distribution")
+        _save(fig, "prm_rejection_rate")
+
+    logger.info("All plots saved to %s", plots_dir)
+
+
+# ===========================================================================
+# Section 11 – Answer checker (shared utility)
+# ===========================================================================
 
 
 def _check_answer(predicted: str, ground_truth: str) -> bool:
     """Lightweight answer checker: compare numeric values when possible.
 
-    Falls back to exact string match when conversion fails.
+    Falls back to exact string match when numeric conversion fails.
     """
     pred = predicted.strip().lstrip("$").rstrip(".")
     gt = ground_truth.strip().lstrip("$").rstrip(".")
@@ -1201,42 +1664,70 @@ def _check_answer(predicted: str, ground_truth: str) -> bool:
         return pred.lower() == gt.lower()
 
 
+# ===========================================================================
+# Section 12 – Main execution block
+# ===========================================================================
+
+
 def main() -> None:
-    """Run PRSE vs Best-of-N on 5 GSM8K sample problems and print results.
+    """Run PRSE vs Best-of-N on Level 4/5 MATH problems and save results.
 
-    Outputs
-    -------
-    A Pandas DataFrame with columns:
-        Problem         Short truncated problem text.
-        Correct_Answer  Ground-truth answer.
-        BoN_Answer      Best-of-N predicted answer.
-        BoN_Correct     Whether BoN was correct.
-        BoN_Tokens      Total tokens used by BoN.
-        BoN_Time_s      Wall-clock time for BoN.
-        PRSE_Answer     PRSE predicted answer.
-        PRSE_Correct    Whether PRSE was correct.
-        PRSE_Tokens     Total tokens used by PRSE.
-        PRSE_Time_s     Wall-clock time for PRSE.
+    Pipeline
+    --------
+    1. Mount Google Drive (when running in Colab) and set up output dirs.
+    2. Load Level 4 and Level 5 problems from the ``lighteval/MATH`` dataset.
+    3. Initialise vLLM models (generator + PRM) on the H100.
+    4. For each problem:
+       a. Run Best-of-N and record telemetry.
+       b. Run PRSE and record telemetry.
+       c. **Immediately** append one row to ``prse_vs_bon_telemetry.csv``
+          and one record to ``raw_evolutionary_traces.jsonl``.
+    5. On completion (or ``KeyboardInterrupt``): write ``summary_metrics.json``
+       and call ``generate_plots()`` to produce all visualisation artefacts.
+
+    Output files (all under the configured base directory)
+    ------------------------------------------------------
+    ``prse_vs_bon_telemetry.csv``   – per-problem breakdown.
+    ``raw_evolutionary_traces.jsonl`` – full reasoning traces with PRM scores.
+    ``summary_metrics.json``        – aggregate statistics.
+    ``plots/``                      – all PNG/PDF graphs.
     """
-    print("=" * 70)
-    print("Process-Reward Guided Surgical Evolution (PRSE)")
-    print("vs. Best-of-N Baseline")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Process-Reward Guided Surgical Evolution (PRSE) – MATH Benchmark")
+    logger.info("=" * 70)
 
-    # Initialise model manager.
-    # Set prm_model_id=None to use the heuristic PRM (no second model needed).
+    # ------------------------------------------------------------------
+    # 1. Set up output directories (auto-mount Drive when in Colab).
+    # ------------------------------------------------------------------
+    dirs = setup_output_dirs()
+    base_dir: Path = dirs["base"]
+    plots_dir: Path = dirs["plots"]
+    csv_path = base_dir / "prse_vs_bon_telemetry.csv"
+    jsonl_path = base_dir / "raw_evolutionary_traces.jsonl"
+    summary_path = base_dir / "summary_metrics.json"
+
+    # ------------------------------------------------------------------
+    # 2. Load dataset.
+    # ------------------------------------------------------------------
+    problems = load_math_problems(num_problems=50)
+    logger.info("Loaded %d MATH problems (Level 4 & 5).", len(problems))
+
+    # ------------------------------------------------------------------
+    # 3. Initialise models (H100-optimised: 55 % generator, 35 % PRM).
+    # ------------------------------------------------------------------
     manager = LocalModelManager(
         generator_model_id="Qwen/Qwen2.5-Math-7B-Instruct",
-        prm_model_id=None,          # swap for a real PRM model id if available
+        prm_model_id="peiyi9979/math-shepherd-mistral-7b-prm",
         tensor_parallel_size=1,
-        max_model_len=4096,
-        generator_gpu_memory_utilisation=0.90,
+        max_model_len=8192,
+        generator_gpu_memory_utilisation=0.55,
+        prm_gpu_memory_utilisation=0.35,
     )
 
     bon_runner = BestOfNRunner(
         model_manager=manager,
         n=16,
-        max_new_tokens=1024,
+        max_new_tokens=2048,
         temperature=0.8,
     )
     prse_runner = PRSEAlgorithm(
@@ -1245,95 +1736,153 @@ def main() -> None:
         max_generations=5,
         mutation_threshold=0.6,
         perfect_fitness_threshold=0.95,
-        max_new_tokens=1024,
+        max_new_tokens=2048,
         temperature=0.8,
     )
 
-    rows = []
-    for problem, ground_truth in GSM8K_SAMPLES:
-        print(f"\nProblem: {problem[:60]}…")
+    rows: List[Dict[str, Any]] = []
 
-        # --- Best-of-N ---
-        t_bon_start = time.perf_counter()
-        bon_trace, bon_tracker = bon_runner.solve(problem)
-        bon_time = time.perf_counter() - t_bon_start
-        bon_answer = _extract_answer(bon_trace.steps)
-        bon_correct = _check_answer(bon_answer, ground_truth)
-        print(
-            f"  BoN  → answer={bon_answer!r:>8s}  correct={bon_correct}"
-            f"  tokens={bon_tracker.total_tokens}  t={bon_time:.1f}s"
-        )
+    # ------------------------------------------------------------------
+    # 4. Main problem loop.
+    # ------------------------------------------------------------------
+    try:
+        for prob_idx, problem_dict in enumerate(problems):
+            problem: str = problem_dict["problem"]
+            ground_truth: str = problem_dict["answer"]
+            level: str = problem_dict["level"]
+            subject: str = problem_dict["subject"]
 
-        # --- PRSE ---
-        t_prse_start = time.perf_counter()
-        prse_trace, prse_tracker = prse_runner.solve(problem)
-        prse_time = time.perf_counter() - t_prse_start
-        prse_answer = _extract_answer(prse_trace.steps)
-        prse_correct = _check_answer(prse_answer, ground_truth)
-        print(
-            f"  PRSE → answer={prse_answer!r:>8s}  correct={prse_correct}"
-            f"  tokens={prse_tracker.total_tokens}  t={prse_time:.1f}s"
-        )
-
-        rows.append(
-            {
-                "Problem": problem[:50] + "…",
-                "Correct_Answer": ground_truth,
-                "BoN_Answer": bon_answer,
-                "BoN_Correct": bon_correct,
-                "BoN_Tokens": bon_tracker.total_tokens,
-                "BoN_Time_s": round(bon_time, 2),
-                "PRSE_Answer": prse_answer,
-                "PRSE_Correct": prse_correct,
-                "PRSE_Tokens": prse_tracker.total_tokens,
-                "PRSE_Time_s": round(prse_time, 2),
-            }
-        )
-
-    print("\n" + "=" * 70)
-    print("Comparative Results")
-    print("=" * 70)
-
-    if PANDAS_AVAILABLE:
-        df = pd.DataFrame(rows)
-        # Summary row.
-        summary = {
-            "Problem": "TOTALS / ACCURACY",
-            "Correct_Answer": "",
-            "BoN_Answer": "",
-            "BoN_Correct": f"{sum(r['BoN_Correct'] for r in rows)}/{len(rows)}",
-            "BoN_Tokens": sum(r["BoN_Tokens"] for r in rows),
-            "BoN_Time_s": round(sum(r["BoN_Time_s"] for r in rows), 2),
-            "PRSE_Answer": "",
-            "PRSE_Correct": f"{sum(r['PRSE_Correct'] for r in rows)}/{len(rows)}",
-            "PRSE_Tokens": sum(r["PRSE_Tokens"] for r in rows),
-            "PRSE_Time_s": round(sum(r["PRSE_Time_s"] for r in rows), 2),
-        }
-        df = pd.concat(
-            [df, pd.DataFrame([summary])], ignore_index=True
-        )
-        with pd.option_context(
-            "display.max_colwidth", 52,
-            "display.width", 160,
-        ):
-            print(df.to_string(index=False))
-    else:
-        # Fallback plain-text table.
-        header = (
-            f"{'Problem':<52} {'GT':>4} {'BoN':>8} {'B✓':>3}"
-            f" {'BTok':>7} {'Bt':>6} {'PRSE':>8} {'P✓':>3}"
-            f" {'PTok':>7} {'Pt':>6}"
-        )
-        print(header)
-        print("-" * len(header))
-        for r in rows:
-            print(
-                f"{r['Problem']:<52} {r['Correct_Answer']:>4}"
-                f" {r['BoN_Answer']:>8} {str(r['BoN_Correct']):>3}"
-                f" {r['BoN_Tokens']:>7} {r['BoN_Time_s']:>6.1f}"
-                f" {r['PRSE_Answer']:>8} {str(r['PRSE_Correct']):>3}"
-                f" {r['PRSE_Tokens']:>7} {r['PRSE_Time_s']:>6.1f}"
+            logger.info(
+                "[%d/%d] %s | %s | %s…",
+                prob_idx + 1,
+                len(problems),
+                level,
+                subject,
+                problem[:80],
             )
+
+            # --- Best-of-N ---
+            t_bon = time.perf_counter()
+            bon_trace, bon_tracker = bon_runner.solve(problem)
+            bon_wall = time.perf_counter() - t_bon
+            bon_answer = _extract_answer(bon_trace.steps)
+            bon_correct = _check_answer(bon_answer, ground_truth)
+            bon_summary = bon_tracker.summary()
+            logger.info(
+                "  BoN  → answer=%r  correct=%s  tokens=%d  t=%.1fs",
+                bon_answer,
+                bon_correct,
+                bon_summary["total_tokens"],
+                bon_wall,
+            )
+
+            # --- PRSE ---
+            t_prse = time.perf_counter()
+            prse_trace, prse_tracker = prse_runner.solve(problem)
+            prse_wall = time.perf_counter() - t_prse
+            prse_answer = _extract_answer(prse_trace.steps)
+            prse_correct = _check_answer(prse_answer, ground_truth)
+            prse_summary = prse_tracker.summary()
+            logger.info(
+                "  PRSE → answer=%r  correct=%s  tokens=%d  t=%.1fs"
+                "  mutations=%d  crossovers=%d  steps_truncated=%d",
+                prse_answer,
+                prse_correct,
+                prse_summary["total_tokens"],
+                prse_wall,
+                prse_summary["mutations_applied"],
+                prse_summary["crossovers_applied"],
+                prse_summary["steps_truncated"],
+            )
+
+            # --- Build telemetry row ---
+            row: Dict[str, Any] = {
+                "problem_id": prob_idx,
+                "level": level,
+                "subject": subject,
+                "problem_snippet": problem[:120],
+                "ground_truth": ground_truth,
+                # BoN
+                "bon_answer": bon_answer,
+                "bon_correct": bon_correct,
+                "bon_prompt_tokens": bon_summary["prompt_tokens"],
+                "bon_completion_tokens": bon_summary["completion_tokens"],
+                "bon_prm_tokens": bon_summary["prm_tokens"],
+                "bon_total_tokens": bon_summary["total_tokens"],
+                "bon_wall_clock_s": round(bon_wall, 3),
+                # PRSE
+                "prse_answer": prse_answer,
+                "prse_correct": prse_correct,
+                "prse_prompt_tokens": prse_summary["prompt_tokens"],
+                "prse_completion_tokens": prse_summary["completion_tokens"],
+                "prse_prm_tokens": prse_summary["prm_tokens"],
+                "prse_total_tokens": prse_summary["total_tokens"],
+                "prse_wall_clock_s": round(prse_wall, 3),
+                "prse_mutations_applied": prse_summary["mutations_applied"],
+                "prse_crossovers_applied": prse_summary["crossovers_applied"],
+                "prse_steps_truncated": prse_summary["steps_truncated"],
+            }
+            rows.append(row)
+
+            # --- Incremental saves (survive Colab timeouts) ---
+            append_telemetry_row(csv_path, row)
+
+            trace_record: Dict[str, Any] = {
+                "problem_id": prob_idx,
+                "problem": problem,
+                "ground_truth": ground_truth,
+                "level": level,
+                "subject": subject,
+                "bon": {
+                    "answer": bon_answer,
+                    "correct": bon_correct,
+                    "steps": bon_trace.steps,
+                    "step_scores": bon_trace.step_scores,
+                    "total_fitness": bon_trace.total_fitness,
+                },
+                "prse": {
+                    "answer": prse_answer,
+                    "correct": prse_correct,
+                    "steps": prse_trace.steps,
+                    "step_scores": prse_trace.step_scores,
+                    "total_fitness": prse_trace.total_fitness,
+                },
+            }
+            append_trace_record(jsonl_path, trace_record)
+
+    except KeyboardInterrupt:
+        logger.warning("Run interrupted by user.  Saving summary and plots…")
+
+    # ------------------------------------------------------------------
+    # 5. Save aggregate summary and generate plots.
+    # ------------------------------------------------------------------
+    if rows:
+        n = len(rows)
+        bon_acc = sum(r["bon_correct"] for r in rows) / n
+        prse_acc = sum(r["prse_correct"] for r in rows) / n
+        summary: Dict[str, Any] = {
+            "n_problems": n,
+            "bon_accuracy": round(bon_acc, 4),
+            "prse_accuracy": round(prse_acc, 4),
+            "bon_total_tokens": sum(r["bon_total_tokens"] for r in rows),
+            "prse_total_tokens": sum(r["prse_total_tokens"] for r in rows),
+            "bon_total_wall_clock_s": round(
+                sum(r["bon_wall_clock_s"] for r in rows), 2
+            ),
+            "prse_total_wall_clock_s": round(
+                sum(r["prse_wall_clock_s"] for r in rows), 2
+            ),
+        }
+        with open(summary_path, "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+        logger.info("Summary saved to %s", summary_path)
+        logger.info(
+            "Final results — BoN accuracy: %.1f%%  PRSE accuracy: %.1f%%",
+            bon_acc * 100,
+            prse_acc * 100,
+        )
+
+    generate_plots(csv_path, plots_dir)
 
 
 if __name__ == "__main__":
