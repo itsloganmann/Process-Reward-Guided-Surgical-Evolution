@@ -69,10 +69,28 @@ from __future__ import annotations
 import os
 
 # Must be set before any protobuf-backed library (e.g. datasets / tensorboard)
-# is imported.  Protobuf ≥ 4.x removed MessageFactory.GetPrototype; the
-# pure-Python implementation restores the legacy API.  To avoid this overhead
-# in production, pin protobuf to a 3.x release (e.g. protobuf==3.20.*).
+# is imported.  Protobuf 4.x removed MessageFactory.GetPrototype from the
+# default (upb/C++) backend; the pure-Python backend restores it.  Protobuf
+# 5.x removed the pure-Python backend entirely, so callers *must* pin
+# protobuf<5 (see requirements.txt).  Setting the env-var is still useful as
+# a belt-and-suspenders fix for 4.x environments.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+# Early sanity check: warn loudly if the installed protobuf is too new.
+try:
+    from google.protobuf import __version__ as _pb_version  # type: ignore
+    _pb_major = int(_pb_version.split(".")[0])
+    if _pb_major >= 5:
+        import warnings
+        warnings.warn(
+            f"protobuf {_pb_version} detected.  Version 5+ removed the "
+            "pure-Python backend, which breaks MessageFactory.GetPrototype "
+            "used by several downstream libraries (datasets, tensorboard).  "
+            "Please downgrade: pip install 'protobuf>=3.20,<5'",
+            stacklevel=1,
+        )
+except Exception:
+    pass
 
 import csv
 import dataclasses
@@ -1273,7 +1291,7 @@ def load_math_problems(
     subjects: Optional[List[str]] = None,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Load Level 4 and Level 5 problems from the hendrycks/competition_math dataset.
+    """Load Level 4 and Level 5 problems from the lighteval/MATH dataset.
 
     The function loads the HuggingFace dataset (cached locally after the first
     download), filters by level and optionally by subject, then returns a
@@ -1310,13 +1328,26 @@ def load_math_problems(
         )
 
     logger.info(
-        "Loading hendrycks/competition_math dataset (levels: %s, subjects: %s, n=%d)",
+        "Loading lighteval/MATH dataset (levels: %s, subjects: %s, n=%d)",
         sorted(MATH_TARGET_LEVELS),
         subjects or "all",
         num_problems,
     )
 
-    ds = load_dataset("hendrycks/competition_math", split="test")
+    try:
+        ds = load_dataset(
+            "lighteval/MATH", "all", split="test", trust_remote_code=True,
+        )
+    except Exception:
+        # Fall back to the legacy identifier if lighteval/MATH is unavailable.
+        logger.warning(
+            "lighteval/MATH dataset not found; falling back to "
+            "hendrycks/competition_math."
+        )
+        ds = load_dataset(
+            "hendrycks/competition_math", split="test",
+            trust_remote_code=True,
+        )
 
     records: List[Dict[str, Any]] = []
     for item in ds:
