@@ -4,7 +4,7 @@ A test-time scaling algorithm for LLM math reasoning that applies a genetic algo
 
 Designed to run in a Google Colab notebook backed by an NVIDIA H100 GPU (80 GB VRAM), high-power CPU, and 180 GB system RAM.
 
-> **Benchmark pivot**: the pipeline now targets the **competition_math (MATH)** dataset, specifically **Level 4 and Level 5** problems where standard Best-of-N fails, allowing PRSE's surgical search to demonstrate compute efficiency.  The earlier GSM8K experiments are preserved in `gsm8k_initial_results.csv`.
+> **Benchmark pivot**: the pipeline now targets the **HuggingFaceH4/MATH-500** dataset, specifically **Level 4 and Level 5** problems where standard Best-of-N fails, allowing PRSE's surgical search to demonstrate compute efficiency.  The earlier GSM8K experiments are preserved in `gsm8k_initial_results.csv`.
 
 ## Table of Contents
 
@@ -60,7 +60,7 @@ Baseline implementation that generates N independent traces and returns the one 
 
 ### load_math_problems
 
-Loads Level 4 and Level 5 problems from the `lighteval/MATH` HuggingFace dataset with optional subject filtering and reproducible subsampling.
+Loads Level 4 and Level 5 problems from the `HuggingFaceH4/MATH-500` HuggingFace dataset with optional subject filtering and reproducible subsampling.
 
 ### setup_output_dirs
 
@@ -118,7 +118,7 @@ Or inside a Colab or Jupyter notebook:
 
 The script will:
 1. Mount Google Drive (in Colab) and create the output directory.
-2. Load problems from `lighteval/MATH` (Level 4 & 5).
+2. Load problems from `HuggingFaceH4/MATH-500` (Level 4 & 5).
 3. Run PRSE and Best-of-N on each problem, saving results incrementally.
 4. Generate all visualisation plots at the end.
 
