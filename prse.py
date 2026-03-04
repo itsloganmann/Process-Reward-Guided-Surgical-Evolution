@@ -37,7 +37,7 @@ BestOfNRunner
     Baseline: generate N independent traces, pick the highest-fitness one.
 
 load_math_problems()
-    Load Level 4 and Level 5 problems from the hendrycks/competition_math dataset
+    Load Level 4 and Level 5 problems from the HuggingFaceH4/MATH-500 dataset
     (HuggingFace), which provides the challenging benchmark where BoN fails.
 
 setup_output_dirs()
@@ -1291,7 +1291,7 @@ def load_math_problems(
     subjects: Optional[List[str]] = None,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Load Level 4 and Level 5 problems from the lighteval/MATH dataset.
+    """Load Level 4 and Level 5 problems from the HuggingFaceH4/MATH-500 dataset.
 
     The function loads the HuggingFace dataset (cached locally after the first
     download), filters by level and optionally by subject, then returns a
@@ -1328,39 +1328,30 @@ def load_math_problems(
         )
 
     logger.info(
-        "Loading lighteval/MATH dataset (levels: %s, subjects: %s, n=%d)",
+        "Loading HuggingFaceH4/MATH-500 dataset (levels: %s, subjects: %s, n=%d)",
         sorted(MATH_TARGET_LEVELS),
         subjects or "all",
         num_problems,
     )
 
-    try:
-        ds = load_dataset(
-            "lighteval/MATH", "all", split="test", trust_remote_code=True,
-        )
-    except Exception:
-        # Fall back to the legacy identifier if lighteval/MATH is unavailable.
-        logger.warning(
-            "lighteval/MATH dataset not found; falling back to "
-            "hendrycks/competition_math."
-        )
-        ds = load_dataset(
-            "hendrycks/competition_math", split="test",
-            trust_remote_code=True,
-        )
+    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
 
     records: List[Dict[str, Any]] = []
     for item in ds:
         level: str = item.get("level", "")
-        subject: str = item.get("type", item.get("subject", ""))
+        subject: str = item.get("subject", item.get("type", ""))
         if level not in MATH_TARGET_LEVELS:
             continue
         if subjects is not None and subject not in subjects:
             continue
 
         solution: str = item.get("solution", "")
-        # Extract the final \boxed{} answer from the reference solution.
-        answer = _extract_answer(_parse_steps(solution)) or solution.strip()
+        # Use the pre-extracted answer when available; fall back to parsing.
+        answer = (
+            item.get("answer", "")
+            or _extract_answer(_parse_steps(solution))
+            or solution.strip()
+        )
 
         records.append(
             {
@@ -1713,7 +1704,7 @@ def main() -> None:
     Pipeline
     --------
     1. Mount Google Drive (when running in Colab) and set up output dirs.
-    2. Load Level 4 and Level 5 problems from the ``hendrycks/competition_math`` dataset.
+    2. Load Level 4 and Level 5 problems from the ``HuggingFaceH4/MATH-500`` dataset.
     3. Initialise vLLM models (generator + PRM) on the H100.
     4. For each problem:
        a. Run Best-of-N and record telemetry.
