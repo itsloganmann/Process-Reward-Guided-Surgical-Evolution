@@ -1280,7 +1280,8 @@ class BestOfNRunner:
 # ===========================================================================
 
 #: Difficulty levels to include (Level 4 and Level 5 are the hard tiers).
-MATH_TARGET_LEVELS: frozenset = frozenset({"Level 4", "Level 5"})
+#: The HuggingFaceH4/MATH-500 dataset stores levels as integers (1–5).
+MATH_TARGET_LEVELS: frozenset = frozenset({4, 5})
 
 #: Optional subject filter – ``None`` means all subjects are included.
 MATH_TARGET_SUBJECTS: Optional[List[str]] = None
@@ -1314,6 +1315,7 @@ def load_math_problems(
         ``solution`` – the full reference solution (str).
         ``answer``   – the extracted final answer (str).
         ``level``    – difficulty level string, e.g. ``"Level 5"`` (str).
+                       Derived from the dataset's integer ``level`` field.
         ``subject``  – problem type, e.g. ``"Algebra"`` (str).
 
     Raises
@@ -1338,12 +1340,23 @@ def load_math_problems(
 
     records: List[Dict[str, Any]] = []
     for item in ds:
-        level: str = item.get("level", "")
-        subject: str = item.get("subject", item.get("type", ""))
-        if level not in MATH_TARGET_LEVELS:
+        # The dataset stores level as an integer (1–5); normalise it so that
+        # comparison against MATH_TARGET_LEVELS (a frozenset of ints) works.
+        raw_level = item.get("level", "")
+        try:
+            level_int: int = int(raw_level)
+        except (TypeError, ValueError):
             continue
+        if level_int not in MATH_TARGET_LEVELS:
+            continue
+
+        subject: str = item.get("subject", item.get("type", ""))
         if subjects is not None and subject not in subjects:
             continue
+
+        # Convert back to the canonical "Level X" string used throughout the
+        # rest of the codebase (logs, CSV columns, plots, …).
+        level: str = f"Level {level_int}"
 
         solution: str = item.get("solution", "")
         # Use the pre-extracted answer when available; fall back to parsing.
