@@ -493,10 +493,12 @@ class LocalModelManager:
         prompt_tok = 0
         completion_tok = 0
         for req in outputs:
-            prompt_tok += len(req.prompt_token_ids)
+            if req.prompt_token_ids is not None:
+                prompt_tok += len(req.prompt_token_ids)
             for out in req.outputs:
                 texts.append(out.text)
-                completion_tok += len(out.token_ids)
+                if out.token_ids is not None:
+                    completion_tok += len(out.token_ids)
         return texts, prompt_tok, completion_tok
 
     def score_steps(
@@ -551,10 +553,16 @@ class LocalModelManager:
         scores: List[float] = []
         total_tokens = 0
         for req in outputs:
-            total_tokens += len(req.prompt_token_ids)
-            raw = req.outputs[0].text.strip()
-            total_tokens += len(req.outputs[0].token_ids)
-            scores.append(_parse_prm_output(raw))
+            if req.prompt_token_ids is not None:
+                total_tokens += len(req.prompt_token_ids)
+            if req.outputs:
+                out0 = req.outputs[0]
+                raw = out0.text.strip()
+                if out0.token_ids is not None:
+                    total_tokens += len(out0.token_ids)
+                scores.append(_parse_prm_output(raw))
+            else:
+                scores.append(0.5)  # neutral fallback when PRM produces no output
         return scores, total_tokens
 
 
