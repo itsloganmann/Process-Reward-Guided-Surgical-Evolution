@@ -415,8 +415,8 @@ class LocalModelManager:
             model=self.generator_model_id,
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
-            gpu_memory_utilization=self.generator_gpu_memory_utilisation,
-            trust_remote_code=True,
+            gpu_memory_utilization=self.generator_gpu_memory_utilisation, enforce_eager=True,
+            trust_remote_code=False,
         )
         self._log.info("Generator ready.")
 
@@ -437,8 +437,8 @@ class LocalModelManager:
             model=self.prm_model_id,
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
-            gpu_memory_utilization=self.prm_gpu_memory_utilisation,
-            trust_remote_code=True,
+            gpu_memory_utilization=self.prm_gpu_memory_utilisation, enforce_eager=True,
+            trust_remote_code=False,
         )
         self._log.info("PRM ready.")
 
@@ -1332,7 +1332,7 @@ def load_math_problems(
     logger.info(
         "Loading HuggingFaceH4/MATH-500 dataset (levels: %s, subjects: %s, n=%d)",
         sorted(MATH_TARGET_LEVELS),
-        subjects or "all",
+        subjects or None,
         num_problems,
     )
 
@@ -1761,9 +1761,9 @@ def main() -> None:
         generator_model_id="Qwen/Qwen2.5-Math-7B-Instruct",
         prm_model_id="peiyi9979/math-shepherd-mistral-7b-prm",
         tensor_parallel_size=1,
-        max_model_len=8192,
-        generator_gpu_memory_utilisation=0.55,
-        prm_gpu_memory_utilisation=0.35,
+        max_model_len=4096,
+        generator_gpu_memory_utilisation=0.45,
+        prm_gpu_memory_utilisation=0.40,
     )
 
     bon_runner = BestOfNRunner(
