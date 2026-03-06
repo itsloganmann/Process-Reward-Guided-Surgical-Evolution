@@ -538,15 +538,40 @@ class LocalModelManager:
             return scores, 0
 
         self._ensure_prm()
+
+        # Reserve tokens for the PRM response and a small safety margin.
+        _MAX_COMPLETION = 8
+        _SAFETY_MARGIN = 64
+        max_prompt_tokens = self.max_model_len - _MAX_COMPLETION - _SAFETY_MARGIN
+
         prompts = []
         for i, step in enumerate(steps):
             context = "\n".join(steps[: i + 1])
             prompt = _build_prm_prompt(problem, context, step)
+
+            # --- Truncate if the prompt would exceed the context window ---
+            # Use a rough char-based estimate first (≈4 chars/token) to skip
+            # expensive tokenisation when clearly within budget.
+            if len(prompt) > max_prompt_tokens * 3:
+                # Build a shorter context by keeping only the *last* steps
+                # that fit, so the PRM still sees the current step in full.
+                prefix = _build_prm_prompt(problem, "", step)
+                budget_chars = max(max_prompt_tokens * 3 - len(prefix), 0)
+                truncated_lines: List[str] = []
+                char_count = 0
+                for s in reversed(steps[: i + 1]):
+                    if char_count + len(s) + 1 > budget_chars:
+                        break
+                    truncated_lines.insert(0, s)
+                    char_count += len(s) + 1  # +1 for the "\n" joiner
+                context = "\n".join(truncated_lines) if truncated_lines else step
+                prompt = _build_prm_prompt(problem, context, step)
+
             prompts.append(prompt)
 
         sampling_params = SamplingParams(
             temperature=0.0,
-            max_tokens=8,  # Only need a short numeric response.
+            max_tokens=_MAX_COMPLETION,
         )
         outputs = self._prm_llm.generate(prompts, sampling_params)
 
@@ -1769,7 +1794,7 @@ def main() -> None:
         generator_model_id="Qwen/Qwen2.5-Math-7B-Instruct",
         prm_model_id="peiyi9979/math-shepherd-mistral-7b-prm",
         tensor_parallel_size=1,
-        max_model_len=4096,
+        max_model_len=8192,
         generator_gpu_memory_utilisation=0.45,
         prm_gpu_memory_utilisation=0.40,
     )
